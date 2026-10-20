@@ -243,19 +243,23 @@ func idKey(v any) string {
 	return fmt.Sprintf("%v", v)
 }
 
-// MapRowsWithResultMap 使用 ResultMap 将多行映射为 []T
-// （支持 association 一对一 + collection 一对多分组）。
+// groupRowsWithResultMap 将扁平 join 行按 <id> 列分组为父对象列表
+// （association 一对一 + collection 一对多）。
 //
 //   - <id> 列决定父对象分组：相同 id 的行合并，collection 追加子项
 //   - association：从扁平 join 行的列构建嵌套对象（列为空 → null）
 //   - collection：按父 id 分组，每行贡献一个子项
-func MapRowsWithResultMap[T any](
+//   - 无 <id> 列时每行独立成父对象
+//
+// 该中间表示同时服务于：select_one/select_list 的 T 映射与 L2 查询缓存
+// （缓存存分组后的父对象，同一份数据可服务不同目标类型）。
+func groupRowsWithResultMap(
 	rows []map[string]any,
 	resultMap *core.ResultMap,
 	handlers *TypeHandlerRegistry,
-) ([]T, error) {
+) []map[string]any {
 	if len(rows) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	var idCols []string
@@ -306,7 +310,20 @@ func MapRowsWithResultMap[T any](
 			parents = append(parents, buildParentObject(row, resultMap, handlers, idValues))
 		}
 	}
+	return parents
+}
 
+// MapRowsWithResultMap 使用 ResultMap 将多行映射为 []T
+// （支持 association 一对一 + collection 一对多分组）。
+func MapRowsWithResultMap[T any](
+	rows []map[string]any,
+	resultMap *core.ResultMap,
+	handlers *TypeHandlerRegistry,
+) ([]T, error) {
+	parents := groupRowsWithResultMap(rows, resultMap, handlers)
+	if len(parents) == 0 {
+		return nil, nil
+	}
 	out := make([]T, 0, len(parents))
 	for _, p := range parents {
 		t, err := MapRow[T](p)
@@ -318,25 +335,26 @@ func MapRowsWithResultMap[T any](
 	return out, nil
 }
 
-// MapRowWithResultMap 使用 ResultMap 映射单行（select_one 路径；多于一行报错）。
+// MapRowWithResultMap 使用 ResultMap 映射单行（select_one 路径；多于一个父对象报错）。
 //
-// 单行无需分组：直接构建父对象（跳过分组键/索引搭建成本）。
+// v0.4 语义：先分组再计数——join 展开产生的多行属于同一父对象时不算
+// TooManyRows，只有分组后仍多于 1 个父对象才报错。
 func MapRowWithResultMap[T any](
 	rows []map[string]any,
 	resultMap *core.ResultMap,
 	handlers *TypeHandlerRegistry,
 ) (*T, error) {
-	switch len(rows) {
+	parents := groupRowsWithResultMap(rows, resultMap, handlers)
+	switch len(parents) {
 	case 0:
 		return nil, nil
 	case 1:
-		value := buildParentObject(rows[0], resultMap, handlers, nil)
-		t, err := MapRow[T](value)
+		t, err := MapRow[T](parents[0])
 		if err != nil {
 			return nil, newResultMappingError(err, "ResultMap 反序列化失败")
 		}
 		return &t, nil
 	default:
-		return nil, TooManyRowsError(len(rows))
+		return nil, TooManyRowsError(len(parents))
 	}
 }

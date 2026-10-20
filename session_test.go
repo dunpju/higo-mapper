@@ -23,6 +23,7 @@ type testUser struct {
 const userMapperXML = `<mapper namespace="com.test.UserMapper">
     <select id="findById">SELECT id, name, score, active FROM users WHERE id = #{id}</select>
     <select id="findAll">SELECT id, name, score, active FROM users ORDER BY id</select>
+    <select id="findLimited">SELECT id, name, score, active FROM users ORDER BY id LIMIT 5</select>
     <select id="count">SELECT count(*) AS cnt FROM users</select>
     <select id="findByCond">
         SELECT id, name, score, active FROM users

@@ -29,6 +29,9 @@ type SqlSessionFactory struct {
 	typeHandlers      *TypeHandlerRegistry
 	sqlLog            SqlLogConfig
 	bus               *EventBus
+	readRouter        *ReadRouter
+	lifecycle         LifecycleConfig
+	cache             *QueryCache
 	config            *Config
 	baseDir           string
 	// watcher 热重载监视器（nil 表示未启用热重载）
@@ -39,9 +42,10 @@ type SqlSessionFactory struct {
 //
 // 完整流程：
 //  1. 创建数据库连接池（Environment，含 Ping 校验）
-//  2. 初始化 Mapper 注册表并加载所有 XML mapper 文件
-//  3. 初始化类型别名 / 类型处理器注册表
-//  4. 当 mapper_refresh_interval_ms > 0 时启动热重载（失败仅告警，不阻断）
+//  2. 创建只读副本路由器（[[read_environments]]；失败整体报错）
+//  3. 初始化 Mapper 注册表并加载所有 XML mapper 文件
+//  4. 初始化类型别名 / 类型处理器注册表与查询缓存
+//  5. 当 mapper_refresh_interval_ms > 0 时启动热重载（失败仅告警，不阻断）
 //
 // baseDir 用于解析 mapper 文件的相对 glob 路径，通常传入项目根目录。
 func NewSqlSessionFactory(ctx context.Context, config *Config, baseDir string) (*SqlSessionFactory, error) {
@@ -51,16 +55,30 @@ func NewSqlSessionFactory(ctx context.Context, config *Config, baseDir string) (
 		return nil, err
 	}
 
-	// 2. 初始化并加载 Mapper 注册表
-	registry := NewMapperRegistry()
-	if _, err := registry.LoadFromConfig(config, baseDir); err != nil {
+	// 2. 只读副本（读写分离；连接失败则关闭主库后整体报错）
+	router, err := NewReadRouter(ctx, config.ReadEnvironments)
+	if err != nil {
 		env.Close()
 		return nil, err
 	}
 
-	// 3. 初始化类型别名 / 类型处理器注册表
+	// 3. 初始化并加载 Mapper 注册表
+	registry := NewMapperRegistry()
+	if _, err := registry.LoadFromConfig(config, baseDir); err != nil {
+		env.Close()
+		router.Close()
+		return nil, err
+	}
+
+	// 4. 初始化类型别名 / 类型处理器注册表 / 查询缓存
 	aliases := TypeAliasRegistryFromMap(config.TypeAliases)
 	handlers := NewTypeHandlerRegistry()
+	cache := NewQueryCache()
+	for _, ns := range registry.Namespaces() {
+		if m := registry.GetMapper(ns); m != nil && m.Cache != nil {
+			cache.ConfigureNamespace(ns, m.Cache)
+		}
+	}
 
 	// SQL 执行日志配置（从 settings 解析，默认关闭）
 	sqlLog := SqlLogConfig{
@@ -71,7 +89,7 @@ func NewSqlSessionFactory(ctx context.Context, config *Config, baseDir string) (
 	// 事件总线（SQL 执行前/后生命周期事件；无监听器时派发零开销）
 	bus := NewEventBus()
 
-	// 4. 热重载（当 refresh_interval > 0 时启动）
+	// 5. 热重载（当 refresh_interval > 0 时启动）
 	var watcher *MapperWatcher
 	if config.Settings.MapperRefreshIntervalMs > 0 {
 		watchDirs := ExtractWatchDirs(config.Settings.MapperPaths, baseDir)
@@ -93,6 +111,9 @@ func NewSqlSessionFactory(ctx context.Context, config *Config, baseDir string) (
 		typeHandlers:      handlers,
 		sqlLog:            sqlLog,
 		bus:               bus,
+		readRouter:        router,
+		lifecycle:         LifecycleConfig{config.Settings.AutoTimestamps, config.Settings.LogicalDelete},
+		cache:             cache,
 		config:            config,
 		baseDir:           baseDir,
 		watcher:           watcher,
@@ -108,6 +129,12 @@ func NewSqlSessionFactoryFromParts(
 	config *Config,
 	baseDir string,
 ) *SqlSessionFactory {
+	cache := NewQueryCache()
+	for _, ns := range registry.Namespaces() {
+		if m := registry.GetMapper(ns); m != nil && m.Cache != nil {
+			cache.ConfigureNamespace(ns, m.Cache)
+		}
+	}
 	return &SqlSessionFactory{
 		environment:       env,
 		mapperRegistry:    registry,
@@ -117,10 +144,13 @@ func NewSqlSessionFactoryFromParts(
 			Enabled:         config.Settings.SqlLog,
 			SlowThresholdMs: config.Settings.SqlLogSlowThresholdMs,
 		},
-		bus:     NewEventBus(),
-		config:  config,
-		baseDir: baseDir,
-		watcher: nil,
+		bus:        NewEventBus(),
+		readRouter: &ReadRouter{},
+		lifecycle:  LifecycleConfig{config.Settings.AutoTimestamps, config.Settings.LogicalDelete},
+		cache:      cache,
+		config:     config,
+		baseDir:    baseDir,
+		watcher:    nil,
 	}
 }
 
@@ -139,6 +169,15 @@ func (f *SqlSessionFactory) TypeAliasRegistry() *TypeAliasRegistry { return f.ty
 // TypeHandlerRegistry 类型处理器注册表
 func (f *SqlSessionFactory) TypeHandlerRegistry() *TypeHandlerRegistry { return f.typeHandlers }
 
+// ReadRouter 只读副本路由器（未配置副本时 Len() == 0）
+func (f *SqlSessionFactory) ReadRouter() *ReadRouter { return f.readRouter }
+
+// Lifecycle 实体生命周期配置（自动时间戳 / 逻辑删除）
+func (f *SqlSessionFactory) Lifecycle() LifecycleConfig { return f.lifecycle }
+
+// QueryCache 工厂级共享查询缓存（namespace 粒度 L2）
+func (f *SqlSessionFactory) QueryCache() *QueryCache { return f.cache }
+
 // Config 配置
 func (f *SqlSessionFactory) Config() *Config { return f.config }
 
@@ -156,17 +195,21 @@ func (f *SqlSessionFactory) HotReloadEnabled() bool {
 	return f.watcher != nil && f.watcher.IsRunning()
 }
 
-// OpenSession 打开一个新的 SqlSession（请求级，共享工厂的连接池和注册表）
+// OpenSession 打开一个新的 SqlSession（请求级，共享工厂的连接池、注册表、
+// 查询缓存与生命周期配置）
 func (f *SqlSessionFactory) OpenSession() *SqlSession {
 	return newSqlSession(f.environment, f.mapperRegistry, f.typeAliasRegistry,
-		f.typeHandlers, f.sqlLog, f.bus)
+		f.typeHandlers, f.sqlLog, f.bus, f.readRouter, f.lifecycle, f.cache)
 }
 
-// Close 关闭工厂，释放连接池与热重载资源
+// Close 关闭工厂，释放连接池、只读副本与热重载资源
 func (f *SqlSessionFactory) Close() error {
 	if f.watcher != nil {
 		f.watcher.Close()
 		f.watcher = nil
+	}
+	if f.readRouter != nil {
+		f.readRouter.Close()
 	}
 	return f.environment.Close()
 }

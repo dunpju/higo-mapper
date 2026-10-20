@@ -16,6 +16,8 @@ const (
 	ErrQuery
 	// ErrTransaction 事务操作失败
 	ErrTransaction
+	// ErrPagination 分页参数 / 分页语句错误
+	ErrPagination
 	// ErrSerialization 参数序列化失败
 	ErrSerialization
 	// ErrResultMapping 结果映射失败
@@ -43,6 +45,8 @@ func (k ErrorKind) String() string {
 		return "Query"
 	case ErrTransaction:
 		return "Transaction"
+	case ErrPagination:
+		return "Pagination"
 	case ErrSerialization:
 		return "Serialization"
 	case ErrResultMapping:
@@ -119,6 +123,10 @@ func newTransactionError(err error, format string, args ...any) *Error {
 		Message: fmt.Sprintf(format, args...),
 		Err:     err,
 	}
+}
+
+func newPaginationError(format string, args ...any) *Error {
+	return &Error{Kind: ErrPagination, Message: fmt.Sprintf(format, args...)}
 }
 
 func newSerializationError(err error, format string, args ...any) *Error {

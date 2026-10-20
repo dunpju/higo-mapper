@@ -10,8 +10,10 @@ package higomapper
 // 声明了特定 goType 时，通过 TypeHandlerRegistry 查找对应处理器。
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -292,6 +294,152 @@ func (TimeHandler) SetParameter(value any) (any, error) {
 	return nil, newResultMappingError(nil, "time 处理器无法绑定 %T", value)
 }
 
+// ─── JSON / Decimal（v0.4 扩展）────────────────────────────────────
+
+// JsonHandler json 类型处理器：JSON 列 ↔ 通用中间表示（map/slice/标量）。
+//
+// 读取方向：文本严格解析为 JSON（"null" → nil，非法 JSON 报错，不静默降级）。
+// 绑定方向：字符串按已成形 JSON 原样透传（如 "null" / '{"a":1}'），其余值
+// （map/slice/数字/布尔）序列化为 JSON 文本。
+//
+// PostgreSQL 注意：pgx 的 json/jsonb 列在纯文本协议下可能返回非文本类型，
+// 建议 SQL 侧 CAST（SELECT col::text … / CAST(? AS jsonb)）保证文本往返。
+type JsonHandler struct{}
+
+// TypeName 实现 TypeHandler
+func (JsonHandler) TypeName() string { return "json" }
+
+// GetResult 实现 TypeHandler：文本 → 严格 JSON 解析（保持数字精度语义）
+func (JsonHandler) GetResult(value any) (any, error) {
+	switch t := value.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		return parseStrictJSON(t)
+	case []byte:
+		return parseStrictJSON(string(t))
+	case map[string]any, []any: // 驱动已解码（如 lib/pq json 原生）
+		return t, nil
+	}
+	return nil, newResultMappingError(nil, "json 处理器无法读取 %T", value)
+}
+
+// SetParameter 实现 TypeHandler：字符串透传 / 其余序列化 / null → NULL
+func (JsonHandler) SetParameter(value any) (any, error) {
+	switch t := value.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		return t, nil
+	case []byte:
+		return string(t), nil
+	}
+	return marshalJSONString(value)
+}
+
+// parseStrictJSON 严格 JSON 解析（UseNumber 保持数字精度语义）
+func parseStrictJSON(s string) (any, error) {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, newResultMappingError(err, "非法 JSON 文本: %s", truncateForError(s))
+	}
+	// 尾随内容（如 "{}}")同样非法
+	if dec.More() {
+		return nil, newResultMappingError(nil, "JSON 文本含多余内容: %s", truncateForError(s))
+	}
+	return normalizeJSON(v), nil
+}
+
+// marshalJSONString 序列化为 JSON 文本（保持数字精度语义）
+func marshalJSONString(value any) (string, error) {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return "", newSerializationError(err, "JSON 序列化失败: %v", value)
+	}
+	return string(b), nil
+}
+
+// DecimalHandler decimal 类型处理器：金额/精确小数以规范字符串承载。
+//
+// 读取方向按列值类型分派：文本严格校验后透传（规范字符串）、整数转文本、
+// 浮点取最短十进制表示。绑定方向：字符串须通过严格校验（拒绝 "1.2.3"、
+// "abc"、"1e5" 等），数字转换为文本，null 透传，其余报错。
+//
+// 以字符串而非 float64 承载可避免二进制浮点精度丢失（0.1 + 0.2 ≠ 0.3）。
+type DecimalHandler struct{}
+
+// TypeName 实现 TypeHandler
+func (DecimalHandler) TypeName() string { return "decimal" }
+
+// GetResult 实现 TypeHandler：文本严格校验 / 数值转规范字符串
+func (DecimalHandler) GetResult(value any) (any, error) {
+	switch t := value.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		if !isValidDecimal(t) {
+			return nil, newResultMappingError(nil, "非法 decimal 文本 '%s'", truncateForError(t))
+		}
+		return t, nil
+	case []byte:
+		s := string(t)
+		if !isValidDecimal(s) {
+			return nil, newResultMappingError(nil, "非法 decimal 文本 '%s'", truncateForError(s))
+		}
+		return s, nil
+	case int64:
+		return strconv.FormatInt(t, 10), nil
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64), nil
+	}
+	return nil, newResultMappingError(nil, "decimal 处理器无法读取 %T", value)
+}
+
+// SetParameter 实现 TypeHandler
+func (DecimalHandler) SetParameter(value any) (any, error) {
+	switch t := value.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		if !isValidDecimal(t) {
+			return nil, newSerializationError(nil, "非法 decimal 参数 '%s'（须为纯数字，如 \"12.34\"）", t)
+		}
+		return t, nil
+	case int64:
+		return strconv.FormatInt(t, 10), nil
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64), nil
+	}
+	return nil, newSerializationError(nil, "decimal 处理器无法绑定 %T", value)
+}
+
+// isValidDecimal 十进制字面量严格校验：[+-]?(\d+(\.\d*)?|\.\d+)，
+// 不允许空白、指数、下划线、多小数点。
+func isValidDecimal(s string) bool {
+	if s == "" {
+		return false
+	}
+	i := 0
+	if s[i] == '+' || s[i] == '-' {
+		i++
+	}
+	digits, dot := 0, false
+	for ; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+			digits++
+		case c == '.' && !dot:
+			dot = true
+		default:
+			return false
+		}
+	}
+	return digits > 0
+}
+
 // ─── 注册表 ───────────────────────────────────────────────────────
 
 // TypeHandlerRegistry 类型处理器注册表：按类型名查找处理器
@@ -309,6 +457,8 @@ func NewTypeHandlerRegistry() *TypeHandlerRegistry {
 	r.Register(BoolHandler{})
 	r.Register(StringHandler{})
 	r.Register(TimeHandler{})
+	r.Register(JsonHandler{})
+	r.Register(DecimalHandler{})
 	return r
 }
 
@@ -340,7 +490,7 @@ func (r *TypeHandlerRegistry) Lookup(typeName string) (TypeHandler, bool) {
 	case "int", "Int":
 		h, ok := r.handlers["i32"]
 		return h, ok
-	case "double", "Double", "float", "Float", "decimal", "REAL":
+	case "double", "Double", "float", "Float", "REAL":
 		h, ok := r.handlers["f64"]
 		return h, ok
 	case "Boolean", "TINYINT", "BIT":

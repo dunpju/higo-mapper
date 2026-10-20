@@ -1017,3 +1017,73 @@ func TestExtractParameters(t *testing.T) {
 		}
 	}
 }
+
+// ─── <cache/> 二级缓存标签 ───────────────────────────────────────
+
+func TestParseCacheSelfClosingWithAttrs(t *testing.T) {
+	xml := `<mapper namespace="app.UserDao">
+        <cache flushInterval="60000" size="512"/>
+        <select id="findAll">SELECT id FROM users</select>
+        </mapper>`
+	mapper, err := ParseMapper(xml)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapper.Cache == nil {
+		t.Fatal("应解析出 Cache 配置")
+	}
+	if mapper.Cache.FlushIntervalMs != 60000 {
+		t.Errorf("flushInterval: %d", mapper.Cache.FlushIntervalMs)
+	}
+	if mapper.Cache.Size != 512 {
+		t.Errorf("size: %d", mapper.Cache.Size)
+	}
+}
+
+func TestParseCacheBareTagDefaults(t *testing.T) {
+	xml := `<mapper namespace="app.UserDao">
+        <cache/>
+        <select id="findAll">SELECT id FROM users</select>
+        </mapper>`
+	mapper, err := ParseMapper(xml)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapper.Cache == nil {
+		t.Fatal("裸 <cache/> 也应启用缓存（零值配置）")
+	}
+	if mapper.Cache.FlushIntervalMs != 0 || mapper.Cache.Size != 0 {
+		t.Errorf("零值配置: %+v", mapper.Cache)
+	}
+}
+
+func TestParseCachePairedTagAndMissing(t *testing.T) {
+	// 成对标签形式
+	xml := `<mapper namespace="a"><cache size="8"></cache></mapper>`
+	mapper, err := ParseMapper(xml)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapper.Cache == nil || mapper.Cache.Size != 8 {
+		t.Errorf("成对标签: %+v", mapper.Cache)
+	}
+
+	// 未声明 <cache> → nil
+	xml2 := `<mapper namespace="b"><select id="q">SELECT 1</select></mapper>`
+	mapper2, err := ParseMapper(xml2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapper2.Cache != nil {
+		t.Errorf("未声明缓存应为 nil: %+v", mapper2.Cache)
+	}
+}
+
+func TestParseCacheInvalidAttrs(t *testing.T) {
+	for _, attr := range []string{`flushInterval="abc"`, `size="-3"`, `size="1.5"`} {
+		xml := `<mapper namespace="a"><cache ` + attr + `/></mapper>`
+		if _, err := ParseMapper(xml); err == nil {
+			t.Errorf("非法属性 %s 应报错", attr)
+		}
+	}
+}

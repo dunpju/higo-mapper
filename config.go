@@ -48,6 +48,9 @@ type Config struct {
 	Environment EnvironmentConfig
 	// Environments 可选的命名环境（多数据库支持）
 	Environments map[string]EnvironmentConfig
+	// ReadEnvironments 只读副本列表（[[read_environments]]，读写分离；
+	// 空列表 = 不分读，全部走主库）
+	ReadEnvironments []EnvironmentConfig
 	// Settings 全局设置
 	Settings SettingsConfig
 	// TypeAliases 类型别名：XML 短名 → Go 全限定类型名
@@ -78,6 +81,10 @@ type SettingsConfig struct {
 	SqlLog bool
 	// SqlLogSlowThresholdMs 慢查询阈值（毫秒）；仅记录耗时 ≥ 此值的 SQL。0 表示记录全部。
 	SqlLogSlowThresholdMs uint64
+	// AutoTimestamps 自动时间戳（默认关闭；见 lifecycle.go）
+	AutoTimestamps AutoTimestampsConfig
+	// LogicalDelete 逻辑删除（默认关闭；见 lifecycle.go）
+	LogicalDelete LogicalDeleteConfig
 }
 
 // TypeHandlerEntry 自定义类型处理器注册项
@@ -104,17 +111,22 @@ func defaultEnvironmentConfig() EnvironmentConfig {
 }
 
 func defaultSettingsConfig() SettingsConfig {
-	return SettingsConfig{MapperPaths: []string{"mappers/**/*.xml"}}
+	return SettingsConfig{
+		MapperPaths:    []string{"mappers/**/*.xml"},
+		AutoTimestamps: DefaultAutoTimestampsConfig(),
+		LogicalDelete:  DefaultLogicalDeleteConfig(),
+	}
 }
 
 // ─── TOML 解析（中间结构 + 指针字段，精确区分「缺失」与「零值」）──────
 
 type rawConfig struct {
-	Environment  rawEnvironment            `toml:"environment"`
-	Environments map[string]rawEnvironment `toml:"environments"`
-	Settings     rawSettings               `toml:"settings"`
-	TypeAliases  map[string]string         `toml:"type_aliases"`
-	TypeHandlers []TypeHandlerEntry        `toml:"type_handlers"`
+	Environment      rawEnvironment            `toml:"environment"`
+	Environments     map[string]rawEnvironment `toml:"environments"`
+	ReadEnvironments []rawEnvironment          `toml:"read_environments"`
+	Settings         rawSettings               `toml:"settings"`
+	TypeAliases      map[string]string         `toml:"type_aliases"`
+	TypeHandlers     []TypeHandlerEntry        `toml:"type_handlers"`
 }
 
 type rawEnvironment struct {
@@ -125,10 +137,26 @@ type rawEnvironment struct {
 }
 
 type rawSettings struct {
-	MapperPaths             []string `toml:"mapper_paths"`
-	MapperRefreshIntervalMs uint64   `toml:"mapper_refresh_interval_ms"`
-	SqlLog                  *bool    `toml:"sql_log"`
-	SqlLogSlowThresholdMs   uint64   `toml:"sql_log_slow_threshold_ms"`
+	MapperPaths             []string           `toml:"mapper_paths"`
+	MapperRefreshIntervalMs uint64             `toml:"mapper_refresh_interval_ms"`
+	SqlLog                  *bool              `toml:"sql_log"`
+	SqlLogSlowThresholdMs   uint64             `toml:"sql_log_slow_threshold_ms"`
+	AutoTimestamps          *rawAutoTimestamps `toml:"auto_timestamps"`
+	LogicalDelete           *rawLogicalDelete  `toml:"logical_delete"`
+}
+
+type rawAutoTimestamps struct {
+	Enabled         bool   `toml:"enabled"`
+	Format          string `toml:"format"`
+	CreatedAtColumn string `toml:"created_at_column"`
+	UpdatedAtColumn string `toml:"updated_at_column"`
+}
+
+type rawLogicalDelete struct {
+	Enabled      bool   `toml:"enabled"`
+	Column       string `toml:"column"`
+	NormalValue  *int64 `toml:"normal_value"`
+	DeletedValue *int64 `toml:"deleted_value"`
 }
 
 func (r rawEnvironment) toConfig() EnvironmentConfig {
@@ -144,7 +172,7 @@ func (r rawEnvironment) toConfig() EnvironmentConfig {
 	return c
 }
 
-func (r rawSettings) toConfig() SettingsConfig {
+func (r rawSettings) toConfig() (SettingsConfig, error) {
 	c := defaultSettingsConfig()
 	if len(r.MapperPaths) > 0 {
 		c.MapperPaths = r.MapperPaths
@@ -154,7 +182,42 @@ func (r rawSettings) toConfig() SettingsConfig {
 		c.SqlLog = *r.SqlLog
 	}
 	c.SqlLogSlowThresholdMs = r.SqlLogSlowThresholdMs
-	return c
+
+	if r.AutoTimestamps != nil {
+		a := DefaultAutoTimestampsConfig()
+		a.Enabled = r.AutoTimestamps.Enabled
+		if r.AutoTimestamps.Format != "" {
+			f, ok := ParseTimestampFormat(r.AutoTimestamps.Format)
+			if !ok {
+				return c, newConfigError(
+					"[settings.auto_timestamps] 非法 format '%s'（可选 datetime | millis | seconds）",
+					r.AutoTimestamps.Format)
+			}
+			a.Format = f
+		}
+		if r.AutoTimestamps.CreatedAtColumn != "" {
+			a.CreatedAtColumn = r.AutoTimestamps.CreatedAtColumn
+		}
+		if r.AutoTimestamps.UpdatedAtColumn != "" {
+			a.UpdatedAtColumn = r.AutoTimestamps.UpdatedAtColumn
+		}
+		c.AutoTimestamps = a
+	}
+	if r.LogicalDelete != nil {
+		l := DefaultLogicalDeleteConfig()
+		l.Enabled = r.LogicalDelete.Enabled
+		if r.LogicalDelete.Column != "" {
+			l.Column = r.LogicalDelete.Column
+		}
+		if r.LogicalDelete.NormalValue != nil {
+			l.NormalValue = *r.LogicalDelete.NormalValue
+		}
+		if r.LogicalDelete.DeletedValue != nil {
+			l.DeletedValue = *r.LogicalDelete.DeletedValue
+		}
+		c.LogicalDelete = l
+	}
+	return c, nil
 }
 
 // ParseConfigToml 从 TOML 字符串解析配置
@@ -163,9 +226,13 @@ func ParseConfigToml(tomlStr string) (*Config, error) {
 	if _, err := toml.Decode(tomlStr, &raw); err != nil {
 		return nil, newConfigErrorWrap(err, "TOML 解析失败")
 	}
+	settings, err := raw.Settings.toConfig()
+	if err != nil {
+		return nil, err
+	}
 	cfg := &Config{
 		Environment:  raw.Environment.toConfig(),
-		Settings:     raw.Settings.toConfig(),
+		Settings:     settings,
 		TypeAliases:  map[string]string{},
 		TypeHandlers: raw.TypeHandlers,
 	}
@@ -176,6 +243,9 @@ func ParseConfigToml(tomlStr string) (*Config, error) {
 		}
 	} else {
 		cfg.Environments = map[string]EnvironmentConfig{}
+	}
+	for _, e := range raw.ReadEnvironments {
+		cfg.ReadEnvironments = append(cfg.ReadEnvironments, e.toConfig())
 	}
 	for k, v := range raw.TypeAliases {
 		cfg.TypeAliases[k] = v
@@ -221,6 +291,36 @@ func (c *Config) WithPoolMaxConnections(max int) *Config {
 // WithPoolMinConnections 单独覆盖连接池最小连接数
 func (c *Config) WithPoolMinConnections(min int) *Config {
 	c.Environment.PoolMinConnections = min
+	return c
+}
+
+// WithReadEnvironments 设置只读副本列表（整体替换；读写分离）
+func (c *Config) WithReadEnvironments(envs []EnvironmentConfig) *Config {
+	c.ReadEnvironments = envs
+	return c
+}
+
+// WithAutoTimestamps 设置自动时间戳配置（整体替换）
+func (c *Config) WithAutoTimestamps(cfg AutoTimestampsConfig) *Config {
+	c.Settings.AutoTimestamps = cfg
+	return c
+}
+
+// EnableAutoTimestamps 开启自动时间戳（保留当前/默认的格式与列名）
+func (c *Config) EnableAutoTimestamps() *Config {
+	c.Settings.AutoTimestamps.Enabled = true
+	return c
+}
+
+// WithLogicalDelete 设置逻辑删除配置（整体替换）
+func (c *Config) WithLogicalDelete(cfg LogicalDeleteConfig) *Config {
+	c.Settings.LogicalDelete = cfg
+	return c
+}
+
+// EnableLogicalDelete 开启逻辑删除（保留当前/默认的列名与标记值）
+func (c *Config) EnableLogicalDelete() *Config {
+	c.Settings.LogicalDelete.Enabled = true
 	return c
 }
 

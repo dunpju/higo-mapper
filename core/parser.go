@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/xml"
 	"io"
+	"strconv"
 	"strings"
 )
 
@@ -75,6 +76,15 @@ func (p *MyBatisXmlParser) ParseMapper() (*Mapper, error) {
 					return nil, err
 				}
 				mapper.SqlFragments[id] = contents
+			case "cache":
+				// 二级缓存开关：<cache flushInterval="60000" size="512"/>。
+				// encoding/xml 中自闭合标签 = Start 紧跟 End，此处统一在 Start 解析属性。
+				if mapper.Cache == nil {
+					mapper.Cache = &CacheConfig{}
+				}
+				if err := parseCacheAttrs(t, mapper.Cache); err != nil {
+					return nil, err
+				}
 			}
 		case xml.EndElement:
 			if t.Name.Local == "mapper" {
@@ -97,6 +107,27 @@ func stmtTypeOf(name string) StatementType {
 	default:
 		return StatementSelect
 	}
+}
+
+// parseCacheAttrs 解析 <cache> 标签属性（自闭合与成对标签共用）
+func parseCacheAttrs(e xml.StartElement, cfg *CacheConfig) error {
+	for _, a := range e.Attr {
+		switch a.Name.Local {
+		case "flushInterval":
+			v, err := strconv.ParseUint(a.Value, 10, 64)
+			if err != nil {
+				return newParseError("<cache> flushInterval 期望毫秒整数，实际 '%s'", a.Value)
+			}
+			cfg.FlushIntervalMs = v
+		case "size":
+			v, err := strconv.ParseUint(a.Value, 10, 32)
+			if err != nil {
+				return newParseError("<cache> size 期望正整数，实际 '%s'", a.Value)
+			}
+			cfg.Size = uint32(v)
+		}
+	}
+	return nil
 }
 
 // attrValue 按名称读取属性值（标准库已完成实体解码）

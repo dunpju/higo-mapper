@@ -82,6 +82,12 @@ func driverNameOf(driver string) string {
 	}
 }
 
+// DriverNameOf 驱动标识 → database/sql 注册名（导出版本，供 CLI 等外部工具使用）
+func DriverNameOf(driver string) string { return driverNameOf(driver) }
+
+// ResolveDSN 将 URL 形式连接串解析为驱动 DSN（导出版本，供 CLI 等外部工具使用）
+func ResolveDSN(driver, rawURL string) (string, error) { return resolveDSN(driver, rawURL) }
+
 // resolveDSN URL 形式连接串 → 驱动 DSN。不成形 URL 时按原始 DSN 处理。
 func resolveDSN(driver, rawURL string) (string, error) {
 	u, err := url.Parse(rawURL)

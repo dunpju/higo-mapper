@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mapper namespace="com.example.dao.ProductDao">
+
+    <!-- L2 查询缓存：本 namespace 的 select 走缓存；任一写语句成功后整体失效 -->
+    <cache flushInterval="60000" size="128"/>
+
+    <select id="findAll">
+        SELECT id, name, price, created_at, updated_at
+        FROM products
+        ORDER BY id
+    </select>
+
+    <!-- 自动时间戳：insert 时缺失的 created_at/updated_at 由 session 自动填充 -->
+    <insert id="insert">
+        INSERT INTO products (name, price, created_at, updated_at)
+        VALUES (#{name}, #{price}, #{created_at}, #{updated_at})
+    </insert>
+
+    <update id="updatePrice">
+        UPDATE products SET price = #{price}, updated_at = #{updated_at}
+        WHERE id = #{id}
+    </update>
+
+</mapper>

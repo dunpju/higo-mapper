@@ -16,6 +16,8 @@ type Mapper struct {
 	ResultMaps map[string]*ResultMap
 	// SqlFragments SQL 片段 ID → 节点序列
 	SqlFragments map[string][]SqlNode
+	// Cache 二级缓存配置（<cache/> 标签；nil = 该 namespace 未启用缓存）
+	Cache *CacheConfig
 }
 
 // NewMapper 创建空 Mapper
@@ -206,6 +208,14 @@ type NestedMapping struct {
 	Associations []NestedMapping
 	// Collections 更深层嵌套集合
 	Collections []NestedMapping
+}
+
+// CacheConfig 二级缓存配置（<cache/> 标签，MyBatis 风格）
+type CacheConfig struct {
+	// FlushIntervalMs 刷新间隔（毫秒，flushInterval 属性）；0 = 无 TTL（写入失效前一直有效）
+	FlushIntervalMs uint64
+	// Size 最大条目数（size 属性）；0 = 使用运行时默认（1024）
+	Size uint32
 }
 
 // ─── 动态 SQL 节点 ────────────────────────────────────────────────
